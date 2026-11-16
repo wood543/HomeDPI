@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   publish:
+    if: ${{ github.event_name != 'release' || github.event.release.prerelease == false }}
     name: Build and publish HomeDPI
     runs-on: ubuntu-latest
     steps:
