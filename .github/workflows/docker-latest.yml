@@ -1,0 +1,62 @@
+name: Update Docker Hub latest
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Publish HomeDPI core and sync installer"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homedpi-dockerhub-latest
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sign in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: wood543
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Promote both published images without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_release() {
+            curl --fail --silent --show-error --location --retry 3 \
+              https://api.github.com/repos/wood543/HomeDPI/releases/latest |
+              jq -er 'select(.draft == false and .prerelease == false) | .tag_name'
+          }
+          digest() {
+            local info value
+            info=$(docker buildx imagetools inspect "$1") || return 1
+            value=$(awk '$1 == "Digest:" { print $2; exit }' <<< "$info")
+            [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+            printf '%s\n' "$value"
+          }
+
+          release=$(latest_release)
+          [[ "$release" =~ ^v[0-9]+\.[0-9]+\.([1-9]|1[0-2])\.[0-9]+\.[0-9]+-r[1-9][0-9]*$ ]]
+          tag=${release#v}
+          repos=(wood543/homedpi wood543/homedpi-sync)
+          digests=()
+          for repo in "${repos[@]}"; do
+            resolved=$(digest "$repo:$tag")
+            digests+=("$resolved")
+          done
+          for i in "${!repos[@]}"; do
+            repo=${repos[$i]}
+            expected=${digests[$i]}
+            [[ "$(latest_release)" == "$release" ]]
+            docker buildx imagetools create --prefer-index=false --tag "$repo:latest" "$repo@$expected"
+            observed=$(digest "$repo:latest")
+            [[ "$observed" == "$expected" ]]
+            printf '%s:latest = %s:%s (%s)\n' "$repo" "$repo" "$tag" "$observed"
+          done
