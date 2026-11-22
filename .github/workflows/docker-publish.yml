@@ -1,59 +1,83 @@
-name: Publish HomeDPI image
+name: Publish HomeDPI core and sync installer
 
+# Replace the existing workflow only after local image acceptance.
+# One Release package, two images. No automatic release/push trigger.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: GitHub release tag to publish (for example 2.4.11.22.6)
+        description: '正式Release标签'
+        default: v2.4.11.8.1-r2
         required: true
-        default: 2.4.11.22.6
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: homedpi-publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   publish:
-    if: ${{ github.event_name != 'release' || github.event.release.prerelease == false }}
-    name: Build and publish HomeDPI
     runs-on: ubuntu-latest
     steps:
-      - name: Validate release tag
+      - name: Validate tag and download exact package
         id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Accept optional v prefix, 3- or 5-segment version, optional -rN suffix.
-          # BASH_REMATCH[1] is the pure version used for asset name and image tag.
-          if [[ ! "$RELEASE_TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+\.[0-9]+)?)(-r[0-9]+)?$ ]]; then
-            echo "Expected a stable tag like 2.4.11.22.6 (v prefix and -rN suffix optional); got: $RELEASE_TAG" >&2
-            exit 1
-          fi
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.([1-9]|1[0-2])\.[0-9]+\.[0-9]+)-r([1-9][0-9]*)$ ]] || exit 1
           VERSION="${BASH_REMATCH[1]}"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          IMAGE_TAG="${TAG#v}"
+          PACKAGE="homedpi-docker-${VERSION}.tar.gz"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/homedpi"
+          cd "$RUNNER_TEMP/homedpi"
+          BASE="https://github.com/wood543/HomeDPI/releases/download/$TAG"
+          curl --fail --location --retry 3 "$BASE/$PACKAGE" -o "$PACKAGE"
+          curl --fail --location --retry 3 "$BASE/sha256sums.txt" -o sha256sums.txt
+          export PACKAGE TAG
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, tarfile
+          package = pathlib.Path(os.environ['PACKAGE'])
+          matches = []
+          for line in pathlib.Path('sha256sums.txt').read_text().splitlines():
+              parts = line.split(maxsplit=1)
+              if len(parts) == 2 and parts[1].lstrip('*') == package.name:
+                  matches.append(parts[0])
+          assert len(matches) == 1 and re.fullmatch('[a-fA-F0-9]{64}', matches[0]), 'Missing/duplicate package checksum'
+          with package.open('rb') as f:
+              assert hashlib.file_digest(f, 'sha256').hexdigest() == matches[0].lower(), 'Checksum mismatch'
+          with tarfile.open(package) as archive:
+              archive.extractall('build', filter='data')
+          root = pathlib.Path('build/homedpi')
+          meta = json.loads((root/'core/release.json').read_text())
+          assert meta['channel'] == 'stable' and meta.get('release_id'), 'Candidate is not publishable'
+          assert type(meta['release_sequence']) is int and meta['release_sequence'] > 0
+          assert os.environ['TAG'] == f"v{meta['version']}-r{meta['release_sequence']}"
+          assert (root/'VERSION').read_text().strip() == meta['version']
+          assert (root/'docker/sync-updater/Dockerfile.standalone').is_file(), 'Package lacks new sync source'
+          PY
 
-      - name: Download and verify the Docker installation package
+      - name: Build both images from this package
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          VERSION: ${{ steps.release.outputs.version }}
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
         run: |
-          set -euo pipefail
-          package="homedpi-docker-${VERSION}.tar.gz"
-          base="https://github.com/wood543/HomeDPI/releases/download/${RELEASE_TAG}"
-          mkdir -p "$RUNNER_TEMP/homedpi-release"
-          cd "$RUNNER_TEMP/homedpi-release"
-          curl --fail --location --retry 3 "$base/$package" --output "$package"
-          curl --fail --location --retry 3 "$base/sha256sums.txt" --output sha256sums.txt
-          sha256sum --ignore-missing --check sha256sums.txt
-          mkdir build
-          tar -xzf "$package" --no-same-owner -C build
-          test -f build/homedpi/Dockerfile
+          set -eu
+          cd "$RUNNER_TEMP/homedpi/build/homedpi"
+          docker build -t "wood543/homedpi:$IMAGE_TAG" .
+          docker build -f docker/sync-updater/Dockerfile.standalone -t "wood543/homedpi-sync:$IMAGE_TAG" docker/sync-updater
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Check image metadata and sync imports before push
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -eu
+          docker run --rm --network none --entrypoint python "wood543/homedpi:$IMAGE_TAG" -c 'import json,pathlib; m=json.loads(pathlib.Path("/app/core/release.json").read_text()); assert m["channel"]=="stable"; assert pathlib.Path("/app/VERSION").read_text().strip()==m["version"]'
+          docker run --rm --network none --entrypoint python "wood543/homedpi-sync:$IMAGE_TAG" -c 'import sys; sys.path.insert(0,"/opt/homedpi-update"); import bootstrap,worker,supervisor; from library_sync.build import load_sources,Resolver; import library_sync.pipeline; assert load_sources(); assert Resolver().apps'
 
       - name: Sign in to Docker Hub
         uses: docker/login-action@v4
@@ -61,13 +85,19 @@ jobs:
           username: wood543
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and publish image
-        uses: docker/build-push-action@v7
+      - name: Push versioned images and prepare manifest
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -eu
+          docker push "wood543/homedpi-sync:$IMAGE_TAG"
+          docker push "wood543/homedpi:$IMAGE_TAG"
+          DIGEST=$(docker image inspect "wood543/homedpi:$IMAGE_TAG" --format '{{index .RepoDigests 0}}')
+          cd "$RUNNER_TEMP/homedpi/build/homedpi"
+          python3 docker/sync-updater/make_manifest.py --metadata core/release.json --image "$DIGEST" --output "$RUNNER_TEMP/homedpi/homedpi-image.json"
+
+      - name: Save verified release attachment for review
+        uses: actions/upload-artifact@v4
         with:
-          context: ${{ runner.temp }}/homedpi-release/build/homedpi
-          file: ${{ runner.temp }}/homedpi-release/build/homedpi/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            wood543/homedpi:${{ steps.release.outputs.version }}
-            wood543/homedpi:latest
+          name: homedpi-image-${{ steps.release.outputs.image_tag }}
+          path: ${{ runner.temp }}/homedpi/homedpi-image.json
